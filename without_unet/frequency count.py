@@ -1,230 +1,475 @@
-import os
-import csv
-import cv2
+def __init__(self):
+    # Initialize your variables here
+    self.bool_noise_removal = False
+    self.bool_img_read = False
+    self.bool_resize = False
+    self.bool_ts_read = False
+    # Initialize your windows/message boxes here
+
+
+def noiseremoval(self):
+    self.bool_noise_removal = True
+
+    if self.bool_img_read and self.bool_resize:
+        try:
+            # Your noise removal logic for images
+            CTk.messagebox.showinfo("Success", "Noise removal completed for image")
+            self.process_window.insert("end", "---------------------")
+            self.result_window.insert("end", "---------------------")
+        except Exception as e:
+            CTk.messagebox.showerror("Error", f"Failed to remove noise from image: {str(e)}")
+            self.process_window.insert("end", "---------------------")
+            self.result_window.insert("end", "---------------------")
+
+    elif self.bool_ts_read and self.bool_resize:
+        try:
+            # Your noise removal logic for time series/data
+            CTk.messagebox.showinfo("Success", "Noise removal completed for time series")
+            self.process_window.insert("end", "---------------------")
+            self.result_window.insert("end", "---------------------")
+        except Exception as e:
+            CTk.messagebox.showerror("Error", f"Failed to remove noise from time series: {str(e)}")
+            self.process_window.insert("end", "---------------------")
+            self.result_window.insert("end", "---------------------")
+    else:
+        CTk.messagebox.showwarning("Warning", "Please ensure image/TS is read and resized first")
+
+
+
+
+###########
 import numpy as np
-import networkx as nx
 import pandas as pd
-from pathlib import Path
-from PIL import Image
-from skimage.morphology import skeletonize
-from scipy.spatial import distance_matrix, cKDTree
-from concurrent.futures import ProcessPoolExecutor
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
-class ImageLoader:
-    """Handles multi-format image loading with Unicode path support."""
-
-    def load_grayscale(self, file_path: Path) -> np.ndarray:
-        try:
-            img_array = np.fromfile(str(file_path), dtype=np.uint8)
-            if img_array.size > 0:
-                img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-                if img is not None:
-                    return img
-        except Exception:
-            pass
-
-        with Image.open(file_path) as pil_img:
-            return np.array(pil_img.convert("L"))
+def tsallis_eswish(x, beta=1.5, q=1.5):
+    sigmoid_part = tf.sigmoid(beta * x)
+    return x * tf.pow(sigmoid_part, q)
 
 
-class SkeletonExtractor:
-    """Extracts skeleton centerlines and key node positions."""
+class TsallisESwish(layers.Layer):
+    def __init__(self, beta=1.5, q=1.5, **kwargs):
+        super(TsallisESwish, self).__init__(**kwargs)
+        self.beta = beta
+        self.q = q
 
-    def __init__(self, threshold: int = 127):
-        self.threshold = threshold
-        self.kernel = np.array([[1, 1, 1],
-                                [1, 10, 1],
-                                [1, 1, 1]], dtype=np.uint8)
+    def call(self, inputs):
+        return tsallis_eswish(inputs, self.beta, self.q)
 
-    def extract_nodes(self, image: np.ndarray):
-        _, binary = cv2.threshold(image, self.threshold, 255, cv2.THRESH_BINARY)
-        skeleton = skeletonize(binary > 0)
-
-        neighbor_count = cv2.filter2D(skeleton.astype(np.uint8), -1, self.kernel)
-        endpoints = (skeleton & (neighbor_count == 11))
-        bifurcations = (skeleton & (neighbor_count >= 13))
-
-        ep_y, ep_x = np.where(endpoints)
-        bp_y, bp_x = np.where(bifurcations)
-
-        all_x = np.concatenate([ep_x, bp_x])
-        all_y = np.concatenate([ep_y, bp_y])
-        nodes = np.column_stack((all_x, all_y))
-
-        return skeleton, nodes, len(ep_x), len(bp_x)
+    def get_config(self):
+        config = super().get_config()
+        config.update({'beta': self.beta, 'q': self.q})
+        return config
 
 
-class GabrielGraphBuilder:
-    """Constructs a Gabriel Graph using O(N) memory KD-Tree queries."""
+class ConvNeXTBlock(layers.Layer):
+    def __init__(self, filters, kernel_size=7, stride=1, expansion=4,
+                 beta=1.5, q=1.5, dropout_rate=0.1, **kwargs):
+        super(ConvNeXTBlock, self).__init__(**kwargs)
 
-    def __init__(self, k: float = 0.1, x0: float = 50.0):
-        self.k = k
-        self.x0 = x0
+        hidden_dim = filters * expansion
 
-    def _logistic_weight(self, dist: float) -> float:
-        return 1.0 / (1.0 + np.exp(-self.k * (dist - self.x0)))
+        self.dwconv = layers.DepthwiseConv2D(
+            kernel_size=kernel_size,
+            strides=stride,
+            padding='same'
+        )
 
-    def build(self, nodes: np.ndarray) -> nx.Graph:
-        G = nx.Graph()
-        num_nodes = len(nodes)
+        self.ln1 = layers.LayerNormalization(epsilon=1e-6)
 
-        for i in range(num_nodes):
-            G.add_node(i, pos=nodes[i])
+        self.pwconv1 = layers.Conv2D(hidden_dim, kernel_size=1)
+        self.activation = TsallisESwish(beta=beta, q=q)
+        self.pwconv2 = layers.Conv2D(filters, kernel_size=1)
+        self.dropout = layers.Dropout(dropout_rate)
+        self.skip = layers.Add()
 
-        if num_nodes < 2:
-            return G
+        self.stride = stride
+        self.filters = filters
 
-        tree = cKDTree(nodes)
-        dist_mat = distance_matrix(nodes, nodes)
+    def call(self, inputs, training=None):
+        x = self.dwconv(inputs)
+        x = self.ln1(x)
+        x = self.pwconv1(x)
+        x = self.activation(x)
+        x = self.dropout(x, training=training)
+        x = self.pwconv2(x)
+        x = self.dropout(x, training=training)
 
-        for i in range(num_nodes):
-            for j in range(i + 1, num_nodes):
-                midpoint = (nodes[i] + nodes[j]) / 2.0
-                radius = dist_mat[i, j] / 2.0
+        if self.stride == 1 and inputs.shape[-1] == self.filters:
+            x = self.skip([inputs, x])
 
-                neighbor_indices = tree.query_ball_point(midpoint, r=radius - 1e-7)
-                in_circle = [idx for idx in neighbor_indices if idx != i and idx != j]
-
-                if len(in_circle) == 0:
-                    dist = dist_mat[i, j]
-                    weight = self._logistic_weight(dist)
-                    G.add_edge(i, j, distance=dist, weight=weight)
-
-        return G
-
-
-class AVFrequencyAnalyzer:
-    """Calculates Arteriovenous structural frequency metrics from graph network."""
-
-    def analyze(self, G: nx.Graph, skeleton: np.ndarray, num_ep: int, num_bp: int) -> dict:
-        total_nodes = G.number_of_nodes()
-        total_edges = G.number_of_edges()
-
-        # Calculate vessel pixel density
-        vessel_pixels = np.count_nonzero(skeleton)
-        total_pixels = skeleton.size
-        vessel_density = (vessel_pixels / total_pixels) if total_pixels > 0 else 0.0
-
-        # Node degree distributions (A/V branching frequency)
-        degrees = [d for _, d in G.degree()]
-        avg_degree = float(np.mean(degrees)) if degrees else 0.0
-        max_degree = int(np.max(degrees)) if degrees else 0
-
-        # Calculate edge lengths
-        distances = [d.get("distance", 0.0) for _, _, d in G.edges(data=True)]
-        total_vessel_length = float(np.sum(distances)) if distances else 0.0
-        avg_segment_length = float(np.mean(distances)) if distances else 0.0
-
-        return {
-            "Total_Nodes": total_nodes,
-            "Endpoints_Count": num_ep,
-            "Bifurcations_Count": num_bp,
-            "Total_Edges": total_edges,
-            "Average_Node_Degree": round(avg_degree, 4),
-            "Max_Branching_Degree": max_degree,
-            "Vessel_Density": round(vessel_density, 6),
-            "Total_Vessel_Length_px": round(total_vessel_length, 2),
-            "Avg_Segment_Length_px": round(avg_segment_length, 2)
-        }
+        return x
 
 
-class SingleFileAVProcessor:
-    """Extracts A/V features for a single file task."""
+class TsallisESwishConvNeXT(Model):
+    def __init__(self, input_shape, num_classes, num_blocks=[3, 3, 9, 3],
+                 filters=[96, 192, 384, 768], beta=1.5, q=1.5, dropout_rate=0.1):
+        super(TsallisESwishConvNeXT, self).__init__()
 
-    def __init__(self):
-        self.loader = ImageLoader()
-        self.extractor = SkeletonExtractor()
-        self.builder = GabrielGraphBuilder()
-        self.analyzer = AVFrequencyAnalyzer()
+        self.stem = keras.Sequential([
+            layers.Conv2D(filters[0], kernel_size=4, strides=4, padding='same'),
+            TsallisESwish(beta=beta, q=q),
+            layers.LayerNormalization(epsilon=1e-6)
+        ])
 
-    def process_file(self, file_path: Path, input_dir: Path) -> dict:
-        relative_path = file_path.relative_to(input_dir)
-        category = relative_path.parts[0] if len(relative_path.parts) > 1 else "Uncategorized"
+        self.stages = []
+        for stage_idx, (num_blocks, stage_filters) in enumerate(zip(num_blocks, filters)):
+            stage_blocks = []
 
-        try:
-            image = self.loader.load_grayscale(file_path)
-            skeleton, nodes, num_ep, num_bp = self.extractor.extract_nodes(image)
-            graph = self.builder.build(nodes)
+            stride = 2 if stage_idx > 0 else 1
+            stage_blocks.append(
+                ConvNeXTBlock(stage_filters, stride=stride, expansion=4,
+                              beta=beta, q=q, dropout_rate=dropout_rate)
+            )
 
-            metrics = self.analyzer.analyze(graph, skeleton, num_ep, num_bp)
-            metrics["File_Name"] = file_path.name
-            metrics["Relative_Path"] = str(relative_path)
-            metrics["Category"] = category
+            for _ in range(1, num_blocks):
+                stage_blocks.append(
+                    ConvNeXTBlock(stage_filters, stride=1, expansion=4,
+                                  beta=beta, q=q, dropout_rate=dropout_rate)
+                )
 
-            print(f"Extracted A/V counts: {relative_path}")
-            return metrics
+            self.stages.append(keras.Sequential(stage_blocks))
 
-        except Exception as err:
-            print(f"Error {relative_path}: {err}")
-            return None
+        self.global_pool = layers.GlobalAveragePooling2D()
+
+        self.head = keras.Sequential([
+            layers.Dense(512, activation='relu'),
+            layers.Dropout(dropout_rate),
+            layers.Dense(256, activation='relu'),
+            layers.Dropout(dropout_rate),
+            layers.Dense(num_classes, activation='softmax')
+        ])
+
+    def call(self, inputs, training=None):
+        x = self.stem(inputs)
+
+        for stage in self.stages:
+            x = stage(x, training=training)
+
+        x = self.global_pool(x)
+        x = self.head(x, training=training)
+
+        return x
 
 
-def process_av_wrapper(task_args):
-    file_path, input_dir = task_args
-    processor = SingleFileAVProcessor()
-    return processor.process_file(Path(file_path), Path(input_dir))
+def load_and_preprocess_data(lesion_file, vessel_file, fussy_file, target_file=None):
+    lesion_data = pd.read_csv(lesion_file)
+    vessel_data = pd.read_csv(vessel_file)
+    fussy_data = pd.read_csv(fussy_file)
+
+    print(f"Lesion data shape: {lesion_data.shape}")
+    print(f"Vessel data shape: {vessel_data.shape}")
+    print(f"Fussy data shape: {fussy_data.shape}")
+
+    features = pd.concat([lesion_data, vessel_data, fussy_data], axis=1)
+
+    if target_file:
+        targets = pd.read_csv(target_file)
+        return features, targets
+
+    return features
 
 
-class AVFrequencyPipeline:
-    """Orchestrates Arteriovenous Frequency Count extraction across datasets."""
+def preprocess_data(features, targets=None, test_size=0.2, val_size=0.1):
+    X = features.values if hasattr(features, 'values') else features
+    y = None
 
-    def __init__(self, input_dir: str, output_dir: str, valid_exts=(".png", ".jpg", ".jpeg", ".tif"),
-                 max_workers: int = 4):
-        self.input_dir = Path(input_dir).resolve()
-        self.output_dir = Path(output_dir).resolve()
-        self.valid_exts = tuple(ext.lower() for ext in valid_exts)
-        self.max_workers = max_workers
+    if targets is not None:
+        label_encoder = LabelEncoder()
+        if isinstance(targets, pd.DataFrame):
+            y = label_encoder.fit_transform(targets.iloc[:, 0].values)
+        else:
+            y = label_encoder.fit_transform(targets)
 
-    def run(self):
-        if not self.input_dir.exists():
-            print(f"Directory not found: {self.input_dir}")
-            return
+        y = keras.utils.to_categorical(y)
 
-        tasks = []
-        for root, _, files in os.walk(str(self.input_dir)):
-            for file in files:
-                file_path = Path(root) / file
-                if file_path.suffix.lower() in self.valid_exts:
-                    tasks.append((str(file_path), str(self.input_dir)))
+        X_train, X_temp, y_train, y_temp = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=np.argmax(y, axis=1)
+        )
 
-        print(f"Extracting A/V Frequency metrics for {len(tasks)} files...\n")
+        val_size_actual = val_size / (1 - test_size)
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train, y_train, test_size=val_size_actual, random_state=42,
+            stratify=np.argmax(y_train, axis=1)
+        )
 
-        results = []
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            completed = executor.map(process_av_wrapper, tasks)
-            for res in completed:
-                if res:
-                    results.append(res)
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_val = scaler.transform(X_val)
 
-        if results:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            df = pd.DataFrame(results)
+        return X_train, X_val, y_train, y_val, scaler, label_encoder
 
-            # Reorder columns cleanly
-            first_cols = ["Category", "File_Name", "Relative_Path"]
-            other_cols = [c for c in df.columns if c not in first_cols]
-            df = df[first_cols + other_cols]
+    return X
 
-            # Save CSV and Excel reports
-            csv_path = self.output_dir / "av_frequency_counts.csv"
-            excel_path = self.output_dir / "av_frequency_counts.xlsx"
 
-            df.to_csv(csv_path, index=False)
-            df.to_excel(excel_path, index=False)
+def reshape_for_cnn(X):
+    num_samples = X.shape[0]
+    num_features = X.shape[1]
 
-            print(f"\nProcessing Complete!")
-            print(f"CSV Report saved to: {csv_path}")
-            print(f"Excel Report saved to: {excel_path}")
+    grid_size = int(np.ceil(np.sqrt(num_features)))
+
+    padded_size = grid_size * grid_size
+    if num_features < padded_size:
+        padding = np.zeros((num_samples, padded_size - num_features))
+        X = np.hstack([X, padding])
+
+    X_reshaped = X.reshape(num_samples, grid_size, grid_size, 1)
+
+    return X_reshaped
+
+
+def train_model(X_train, X_val, y_train, y_val, input_shape, num_classes,
+                epochs=100, batch_size=32, learning_rate=1e-4):
+    model = TsallisESwishConvNeXT(
+        input_shape=input_shape,
+        num_classes=num_classes,
+        beta=1.5,
+        q=1.5,
+        dropout_rate=0.1
+    )
+
+    model.compile(
+        optimizer=Adam(learning_rate=learning_rate),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7)
+    ]
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    return model, history
+
+
+def evaluate_model(model, X_test, y_test, label_encoder=None):
+    y_pred = model.predict(X_test)
+    y_pred_classes = np.argmax(y_pred, axis=1)
+    y_true_classes = np.argmax(y_test, axis=1)
+
+    accuracy = accuracy_score(y_true_classes, y_pred_classes)
+    print(f"\nAccuracy: {accuracy * 100:.2f}%")
+
+    print("\nClassification Report:")
+    print(classification_report(y_true_classes, y_pred_classes,
+                                target_names=label_encoder.classes_ if label_encoder else None))
+
+    cm = confusion_matrix(y_true_classes, y_pred_classes)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.show()
+
+    return accuracy, y_pred_classes
+
+
+def plot_training_history(history):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(history.history['accuracy'], label='Train Accuracy')
+    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    ax1.set_title('Model Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.legend()
+
+    ax2.plot(history.history['loss'], label='Train Loss')
+    ax2.plot(history.history['val_loss'], label='Validation Loss')
+    ax2.set_title('Model Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def generate_synthetic_data(n_samples=1000, n_features=99):
+    np.random.seed(42)
+
+    lesion_features = np.random.randn(n_samples, n_features // 3)
+    vessel_features = np.random.randn(n_samples, n_features // 3)
+    fussy_features = np.random.randn(n_samples, n_features // 3)
+
+    targets = np.random.randint(0, 3, n_samples)
+
+    pd.DataFrame(lesion_features).to_csv('lesion_features.csv', index=False)
+    pd.DataFrame(vessel_features).to_csv('vessel_features.csv', index=False)
+    pd.DataFrame(fussy_features).to_csv('fussy_features.csv', index=False)
+    pd.DataFrame({'target': targets}).to_csv('targets.csv', index=False)
+
+    print("Synthetic data generated and saved to CSV files.")
+
+
+def main():
+    generate_synthetic_data(n_samples=1000, n_features=99)
+
+    lesion_file = 'lesion_features.csv'
+    vessel_file = 'vessel_features.csv'
+    fussy_file = 'fussy_features.csv'
+    target_file = 'targets.csv'
+
+    print("Loading data...")
+    features, targets = load_and_preprocess_data(lesion_file, vessel_file, fussy_file, target_file)
+
+    X_train, X_val, y_train, y_val, scaler, label_encoder = preprocess_data(
+        features, targets, test_size=0.2, val_size=0.1
+    )
+
+    X_train_reshaped = reshape_for_cnn(X_train)
+    X_val_reshaped = reshape_for_cnn(X_val)
+
+    input_shape = X_train_reshaped.shape[1:]
+    num_classes = y_train.shape[1]
+
+    print(f"Input shape: {input_shape}")
+    print(f"Number of classes: {num_classes}")
+    print(f"Training samples: {X_train_reshaped.shape[0]}")
+    print(f"Validation samples: {X_val_reshaped.shape[0]}")
+
+    print("\nTraining model...")
+    model, history = train_model(
+        X_train_reshaped, X_val_reshaped, y_train, y_val,
+        input_shape, num_classes,
+        epochs=100,
+        batch_size=32,
+        learning_rate=1e-4
+    )
+
+    plot_training_history(history)
+
+    print("\nEvaluating on validation set:")
+    accuracy, _ = evaluate_model(model, X_val_reshaped, y_val, label_encoder)
+
+    model.save('tsallis_eswish_convnext_cnn.h5')
+    print("\nModel saved as 'tsallis_eswish_convnext_cnn.h5'")
+
+    return model, history, accuracy
 
 
 if __name__ == "__main__":
-    INPUT_FOLDER = r"Output\vessel_centerline - Copy"
-    OUTPUT_FOLDER = r"Output\av_frequency_analysis"
+    model, history, accuracy = main()
 
-    pipeline = AVFrequencyPipeline(
-        input_dir=INPUT_FOLDER,
-        output_dir=OUTPUT_FOLDER,
-        max_workers=4
-    )
-    pipeline.run()
+
+
+
+#####################################
+import os
+import cv2
+import numpy as np
+
+
+class ImageProcessor:
+    def __init__(self, target_size=(512, 512), clahe_clip_limit=2.0, clahe_grid_size=(8, 8)):
+        self.target_size = target_size
+        self.clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_grid_size)
+
+    def resize(self, image):
+        return cv2.resize(image, self.target_size, interpolation=cv2.INTER_AREA)
+
+    def anisotropic_diffusion(self, image, niter=10, kappa=50, gamma=0.1):
+        img = image.astype('float32')
+        for _ in range(niter):
+            delta_N = np.roll(img, -1, axis=0) - img
+            delta_S = np.roll(img, 1, axis=0) - img
+            delta_E = np.roll(img, -1, axis=1) - img
+            delta_W = np.roll(img, 1, axis=1) - img
+
+            cN = np.exp(-(delta_N / kappa) ** 2)
+            cS = np.exp(-(delta_S / kappa) ** 2)
+            cE = np.exp(-(delta_E / kappa) ** 2)
+            cW = np.exp(-(delta_W / kappa) ** 2)
+
+            img += gamma * (cN * delta_N + cS * delta_S + cE * delta_E + cW * delta_W)
+
+        return np.clip(img, 0, 255).astype('uint8')
+
+    def apply_clahe(self, image):
+        if len(image.shape) == 3:
+            yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+            yuv[:, :, 0] = self.clahe.apply(yuv[:, :, 0])
+            return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+        else:
+            return self.clahe.apply(image)
+
+    def process_folder(self, input_folder, output_folder, skip_folders=None):
+        if skip_folders is None:
+            skip_folders = ['labels', 'mask', 'Label', 'Mask']  # Add folder names to skip
+
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif')
+
+        for root, dirs, files in os.walk(input_folder):
+            # Check if current folder should be skipped
+            folder_name = os.path.basename(root)
+            if folder_name in skip_folders:
+                print(f"Skipping folder: {root}")
+                continue
+
+            for file_name in files:
+                if file_name.lower().endswith(valid_extensions):
+                    input_path = os.path.join(root, file_name)
+
+                    relative_path = os.path.relpath(root, input_folder)
+                    current_output_dir = os.path.join(output_folder, relative_path)
+
+                    if not os.path.exists(current_output_dir):
+                        os.makedirs(current_output_dir)
+
+                    # Replace original file extension with .png
+                    base_name = os.path.splitext(file_name)[0]
+                    png_file_name = f"{base_name}.png"
+                    output_path = os.path.join(current_output_dir, png_file_name)
+
+                    # Read image - this handles all formats including TIF/TIFF
+                    img = cv2.imread(input_path, cv2.IMREAD_COLOR)
+                    if img is None:
+                        # Try reading as is if color read fails
+                        img = cv2.imread(input_path)
+                        if img is None:
+                            print(f"Warning: Could not read image: {input_path}")
+                            continue
+
+                    # Convert to grayscale if it's a color image
+                    if len(img.shape) == 3:
+                        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    else:
+                        gray_img = img
+
+                    resized_img = self.resize(gray_img)
+                    denoised_img = self.anisotropic_diffusion(resized_img, niter=10, kappa=30)
+                    enhanced_img = self.apply_clahe(denoised_img)
+
+                    cv2.imwrite(output_path, enhanced_img)
+                    print(f"Processed: {input_path} -> {output_path}")
+
+
+if __name__ == "__main__":
+    INPUT_DIR = "..\\dataset"
+    OUTPUT_DIR = "..\\Output\\contrast_enhancement"
+
+    # Specify folders to skip (add more if needed)
+    SKIP_FOLDERS = ['labels', 'mask', 'Label', 'Mask', 'ground_truth', 'annotations']
+
+    processor = ImageProcessor(target_size=(512, 512))
+    processor.process_folder(INPUT_DIR, OUTPUT_DIR, skip_folders=SKIP_FOLDERS)
